@@ -1,0 +1,50 @@
+{
+  "use_builtin_core": {
+    "description": "使用内置 Mihomo 核心（自动下载并管理）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后插件会自动下载并启动 Mihomo，无需外部 Clash"
+  },
+  "builtin_mixed_port": {
+    "description": "内置核心混合代理端口",
+    "type": "int",
+    "default": 7890,
+    "hint": "内置核心的 mixed-port"
+  },
+  "builtin_controller_port": {
+    "description": "内置核心控制器端口",
+    "type": "int",
+    "default": 9090,
+    "hint": "内置核心的 external-controller 端口"
+  },
+  "builtin_secret": {
+    "description": "内置核心 API Secret",
+    "type": "string",
+    "default": "",
+    "hint": "留空则自动生成"
+  },
+  "proxy_url": {
+    "description": "代理地址（用于测试连通性）",
+    "type": "string",
+    "default": "http://127.0.0.1:7890",
+    "hint": "例如 http://127.0.0.1:7890"
+  },
+  "controller_url": {
+    "description": "Clash 控制器地址（外部模式时使用）",
+    "type": "string",
+    "default": "http://127.0.0.1:9090",
+    "hint": "外部 Clash 的 External Controller 地址"
+  },
+  "controller_secret": {
+    "description": "控制器 Secret（外部模式时使用）",
+    "type": "string",
+    "default": "",
+    "hint": "对应 Clash 配置中的 secret"
+  },
+  "subscriptions": {
+    "description": "订阅链接列表",
+    "type": "list",
+    "default": [],
+    "hint": "可在 WebUI 中管理"
+  }
+}

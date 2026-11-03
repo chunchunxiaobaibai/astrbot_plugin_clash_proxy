@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Clash Proxy 管理</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Clash Proxy 管理面板</h1>
+      <p class="subtitle">把完整 YAML 粘贴到下方文本框，不要用文件上传</p>
+    </header>
+
+    <section class="card">
+      <h2>状态</h2>
+      <div id="status" class="status-grid">加载中...</div>
+      <button id="btn-refresh-status" class="btn">刷新状态</button>
+    </section>
+
+    <section class="card">
+      <h2>策略组与节点选择</h2>
+      <div id="groups">加载中...</div>
+      <button id="btn-refresh-proxies" class="btn">刷新节点列表</button>
+    </section>
+
+    <section class="card">
+      <h2>订阅管理</h2>
+      <div class="sub-form">
+        <input id="sub-url" type="text" placeholder="输入订阅链接 (http/https)" />
+        <button id="btn-add-sub" class="btn primary">添加订阅</button>
+      </div>
+      <div id="subs-list"></div>
+      <div class="actions">
+        <button id="btn-update-subs" class="btn">更新所有订阅</button>
+        <button id="btn-refresh-subs" class="btn">刷新列表</button>
+      </div>
+      <div id="sub-message" class="message"></div>
+    </section>
+
+    <section class="card">
+      <h2>导入配置（粘贴 YAML）</h2>
+      <div class="sub-form">
+        <textarea id="yaml-paste" rows="12" placeholder="在此直接粘贴完整的 Clash YAML 配置内容..." style="width:100%;font-family:monospace;font-size:13px;padding:8px;border:1px solid #ddd;border-radius:4px;resize:vertical;"></textarea>
+      </div>
+      <div class="actions">
+        <button id="btn-import-paste" class="btn primary">保存并推送到 Clash</button>
+        <button id="btn-import-save-only" class="btn">仅保存</button>
+      </div>
+      <div id="configs-list"></div>
+      <div id="config-message" class="message"></div>
+    </section>
+  </div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
