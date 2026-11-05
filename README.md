@@ -32,7 +32,10 @@
 
 ## 数据存储
 
-订阅文件保存在 `data/plugin_data/astrbot_plugin_clash_proxy/subs/` 目录下。
+- 订阅原文保存在 `data/plugin_data/astrbot_plugin_clash_proxy/subs/`
+- 内置核心的持久配置是 `data/plugin_data/astrbot_plugin_clash_proxy/core/config.yaml`
+
+推送到 Clash 时会同时写入 `core/config.yaml`（并保留 mixed-port / external-controller / secret）。AstrBot 或插件重启后，内置 Mihomo 会读这份文件，节点不会丢。
 
 ## 开发参考
 

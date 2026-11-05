@@ -41,12 +41,18 @@ async function refreshStatus() {
     const data = await bridge.apiGet("status");
     const p = data.proxy || {};
     const c = data.controller || {};
+    const persist = data.persist || {};
+    const persistClass = persist.has_nodes ? "ok" : "";
+    const lastApplied = persist.last_applied ? `<br>上次配置: ${escapeHtml(persist.last_applied)}` : "";
     el.innerHTML = `
       <div class="status-item ${p.ok ? "ok" : "error"}">
         <strong>代理</strong><br>${escapeHtml(p.url || "-")}<br>${escapeHtml(p.message || (p.ok ? "可用" : "不可用"))}
       </div>
       <div class="status-item ${c.ok ? "ok" : "error"}">
         <strong>控制器</strong><br>${escapeHtml(c.url || "-")}<br>${escapeHtml(c.version || c.message || (c.ok ? "可用" : "不可用"))}
+      </div>
+      <div class="status-item persist ${persistClass}">
+        <strong>持久配置</strong><br>推送到 Clash 时会写入磁盘，重启后仍保留节点${lastApplied}
       </div>
     `;
   } catch (e) {

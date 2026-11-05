@@ -15,7 +15,7 @@ import asyncio
 import gzip
 import shutil
 import secrets
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from urllib.parse import quote
 
 PLUGIN_NAME = "astrbot_plugin_clash_proxy"
@@ -44,7 +44,44 @@ GEODATA_FILES = {
     ],
 }
 
-@register(PLUGIN_NAME, "pan xie", "Clash 代理管理与订阅导入插件（支持内置核心）", "1.3.0")
+def dump_yaml(data: Dict[str, Any]) -> str:
+    return yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+
+def config_has_nodes(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    proxies = data.get("proxies")
+    if isinstance(proxies, list) and any(isinstance(item, dict) for item in proxies):
+        return True
+    providers = data.get("proxy-providers")
+    return isinstance(providers, dict) and len(providers) > 0
+
+
+def controller_host_from_url(url: str) -> str:
+    host = (url or "").strip().rstrip("/")
+    for prefix in ("http://", "https://"):
+        if host.lower().startswith(prefix):
+            host = host[len(prefix):]
+            break
+    return host or "127.0.0.1:9090"
+
+
+def merge_runtime_keys(content: str, runtime: Dict[str, Any]) -> str:
+    try:
+        data = yaml.safe_load(content)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return content.rstrip() + "\n" + dump_yaml(runtime)
+    data.update(runtime)
+    profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+    profile.setdefault("store-selected", True)
+    data["profile"] = profile
+    return dump_yaml(data)
+
+
+@register(PLUGIN_NAME, "pan xie", "Clash 代理管理与订阅导入插件（支持内置核心）", "1.4.3")
 class ClashProxyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -58,10 +95,14 @@ class ClashProxyPlugin(Star):
         self.bin_dir.mkdir(parents=True, exist_ok=True)
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.subs_index_file = self.data_dir / "subscriptions.json"
+        self.state_file = self.data_dir / "runtime_state.json"
         self.core_config_file = self.config_dir / "config.yaml"
         self.core_process: Optional[asyncio.subprocess.Process] = None
         self._core_lock = asyncio.Lock()
         self._paste_chunks: Dict[str, Dict[str, Any]] = {}
+        self._stop_requested = False
+        self._user_stopped = False
+        self._watchdog_task: Optional[asyncio.Task] = None
 
         # 注册 Web API
         context.register_web_api(f"/{PLUGIN_NAME}/status", self.api_status, ["GET"], "获取状态")
@@ -84,9 +125,20 @@ class ClashProxyPlugin(Star):
         logger.info("Clash Proxy 插件已加载（支持内置核心）")
         await self._load_subscriptions()
         if self.config.get("use_builtin_core", False):
-            asyncio.create_task(self._ensure_core_running())
+            self._stop_requested = False
+            self._user_stopped = False
+            self._watchdog_task = asyncio.create_task(self._ensure_core_running())
 
     async def terminate(self):
+        self._stop_requested = True
+        task = self._watchdog_task
+        self._watchdog_task = None
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await self._stop_core()
 
     # ==================== 内置核心管理 ====================
@@ -158,30 +210,144 @@ class ClashProxyPlugin(Star):
             logger.error(f"[ClashProxy] 下载核心异常: {e}")
             return False
 
-    def _ensure_core_config(self):
-        if self.core_config_file.exists():
-            return
+    def _try_save_plugin_config(self):
+        save = getattr(self.config, "save", None)
+        if callable(save):
+            try:
+                save()
+            except Exception:
+                pass
+
+    def _ensure_secret(self) -> str:
+        secret = str(self.config.get("builtin_secret") or "")
+        if secret:
+            return secret
+        data = self._load_yaml_file(self.core_config_file)
+        if data and data.get("secret"):
+            secret = str(data["secret"])
+            self.config["builtin_secret"] = secret
+            self._try_save_plugin_config()
+            return secret
+        secret = secrets.token_hex(16)
+        self.config["builtin_secret"] = secret
+        self._try_save_plugin_config()
+        return secret
+
+    def _builtin_runtime_keys(self) -> Dict[str, Any]:
         port = int(self.config.get("builtin_mixed_port", 7890))
         ctrl_port = int(self.config.get("builtin_controller_port", 9090))
-        secret = self.config.get("builtin_secret") or secrets.token_hex(16)
-        if not self.config.get("builtin_secret"):
-            self.config["builtin_secret"] = secret
-
-        minimal = {
+        return {
             "mixed-port": port,
             "allow-lan": True,
             "bind-address": "*",
+            "external-controller": f"0.0.0.0:{ctrl_port}",
+            "secret": self._ensure_secret(),
+        }
+
+    def _merge_runtime_keys(self, content: str) -> str:
+        if self.config.get("use_builtin_core", False):
+            return merge_runtime_keys(content, self._builtin_runtime_keys())
+        try:
+            data = yaml.safe_load(content)
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            return content
+        if not data.get("external-controller"):
+            data["external-controller"] = controller_host_from_url(
+                self.config.get("controller_url", "http://127.0.0.1:9090")
+            )
+        secret = str(self.config.get("controller_secret") or "")
+        if secret and not data.get("secret"):
+            data["secret"] = secret
+        return dump_yaml(data)
+
+    def _write_text_atomic(self, path: Path, text: str):
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+
+    def _write_core_config(self, content: str):
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self._write_text_atomic(self.core_config_file, content)
+
+    def _load_yaml_file(self, path: Path) -> Optional[Dict[str, Any]]:
+        if not path.exists():
+            return None
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8", errors="ignore"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _load_state(self) -> Dict[str, Any]:
+        if not self.state_file.exists():
+            return {}
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_state(self, patch: Dict[str, Any]):
+        data = self._load_state()
+        data.update(patch)
+        self._write_text_atomic(self.state_file, json.dumps(data, ensure_ascii=False, indent=2))
+
+    def _get_last_applied(self) -> str:
+        return str(self._load_state().get("last_applied") or "")
+
+    def _set_last_applied(self, filename: str):
+        if filename:
+            self._save_state({"last_applied": filename})
+
+    def _find_restore_source(self) -> Optional[Path]:
+        name = self._get_last_applied()
+        if name:
+            path = self.subs_dir / name
+            if path.exists() and path.stat().st_size > 50:
+                return path
+        candidates = sorted(
+            list(self.subs_dir.glob("*.yaml")) + list(self.subs_dir.glob("*.yml")),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        for path in candidates:
+            if config_has_nodes(self._load_yaml_file(path)):
+                return path
+        return None
+
+    def _ensure_core_config(self):
+        data = self._load_yaml_file(self.core_config_file)
+        if config_has_nodes(data):
+            if self.config.get("use_builtin_core", False):
+                runtime = self._builtin_runtime_keys()
+                if any(data.get(key) != value for key, value in runtime.items()):
+                    current = self.core_config_file.read_text(encoding="utf-8", errors="ignore")
+                    self._write_core_config(self._merge_runtime_keys(current))
+            return
+
+        source = self._find_restore_source()
+        if source:
+            raw = source.read_text(encoding="utf-8", errors="ignore")
+            self._write_core_config(self._merge_runtime_keys(self._patch_geox(raw)))
+            self._set_last_applied(source.name)
+            logger.info(f"[ClashProxy] 已从 {source.name} 恢复核心配置")
+            return
+
+        runtime = self._builtin_runtime_keys()
+        minimal = {
+            **runtime,
             "mode": "rule",
             "log-level": "info",
-            "external-controller": f"0.0.0.0:{ctrl_port}",
-            "secret": secret,
             "proxies": [],
             "proxy-groups": [
                 {"name": "PROXY", "type": "select", "proxies": ["DIRECT"]}
             ],
-            "rules": ["MATCH,PROXY"]
+            "rules": ["MATCH,PROXY"],
+            "profile": {"store-selected": True},
         }
-        self.core_config_file.write_text(yaml.safe_dump(minimal, allow_unicode=True), encoding="utf-8")
+        self._write_core_config(dump_yaml(minimal))
         logger.info(f"[ClashProxy] 已生成最小配置: {self.core_config_file}")
 
     async def _start_core(self) -> Dict[str, Any]:
@@ -228,15 +394,29 @@ class ClashProxyPlugin(Star):
 
     async def _ensure_core_running(self):
         await asyncio.sleep(1)
-        result = await self._start_core()
-        if not result.get("ok"):
-            logger.warning(f"[ClashProxy] 自动启动核心失败: {result.get('message')}")
+        while not self._stop_requested:
+            if self._user_stopped:
+                await asyncio.sleep(2)
+                continue
+            proc = self.core_process
+            if proc is None or proc.returncode is not None:
+                result = await self._start_core()
+                if not result.get("ok"):
+                    logger.warning(f"[ClashProxy] 自动启动核心失败: {result.get('message')}")
+                    await asyncio.sleep(5)
+                continue
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+                if not self._stop_requested and not self._user_stopped:
+                    logger.warning("[ClashProxy] 内置核心已退出，2 秒后重启")
+                    await asyncio.sleep(2)
+            except asyncio.TimeoutError:
+                continue
 
-    def _get_effective_controller(self) -> tuple[str, str]:
+    def _get_effective_controller(self) -> Tuple[str, str]:
         if self.config.get("use_builtin_core", False):
             port = int(self.config.get("builtin_controller_port", 9090))
-            secret = self.config.get("builtin_secret", "")
-            return f"http://127.0.0.1:{port}", secret
+            return f"http://127.0.0.1:{port}", self._ensure_secret()
         return self.config.get("controller_url", "http://127.0.0.1:9090").rstrip("/"), self.config.get("controller_secret", "")
 
     # ==================== 原有方法（调整控制器获取） ====================
@@ -252,8 +432,6 @@ class ClashProxyPlugin(Star):
         base, _ = self._get_effective_controller()
         return base
 
-    # ... 其余原有方法保持不变（_download_subscription, _check_proxy, _check_controller, _get_proxies_from_clash, _select_proxy, Web API 等）
-
     async def api_core_status(self):
         running = self.core_process is not None and self.core_process.returncode is None
         binary = self._get_binary_path()
@@ -263,34 +441,35 @@ class ClashProxyPlugin(Star):
             "pid": self.core_process.pid if running else None,
             "binary_exists": binary.exists(),
             "config_exists": self.core_config_file.exists(),
+            "has_nodes": config_has_nodes(self._load_yaml_file(self.core_config_file)),
+            "last_applied": self._get_last_applied(),
             "controller": self._get_controller_base()
         })
 
     async def api_core_start(self):
         if not self.config.get("use_builtin_core", False):
             return error_response("请先在配置中开启「使用内置核心」")
+        self._user_stopped = False
         result = await self._start_core()
         if result.get("ok"):
             return json_response(result)
         return error_response(result.get("message", "启动失败"))
 
     async def api_core_stop(self):
+        self._user_stopped = True
         result = await self._stop_core()
         if result.get("ok"):
             return json_response(result)
         return error_response(result.get("message", "停止失败"))
 
     async def api_core_restart(self):
+        self._user_stopped = False
         await self._stop_core()
         await asyncio.sleep(0.5)
         result = await self._start_core()
         if result.get("ok"):
             return json_response(result)
         return error_response(result.get("message", "重启失败"))
-
-    # ==================== 以下保留原有 Web API 与聊天指令 ====================
-    # （为节省篇幅，原有 api_status / api_proxies / api_select_proxy / 订阅 / 配置导入推送 等代码保持不变）
-    # 实际文件中请将原有实现完整保留，仅替换控制器获取相关调用
 
     async def api_status(self):
         proxy = await self._check_proxy()
@@ -303,15 +482,17 @@ class ClashProxyPlugin(Star):
             "proxy": proxy,
             "controller": controller,
             "core": core,
+            "persist": {
+                "has_nodes": config_has_nodes(self._load_yaml_file(self.core_config_file)),
+                "last_applied": self._get_last_applied(),
+                "config_file": str(self.core_config_file),
+            },
             "config": {
                 "proxy_url": self.config.get("proxy_url"),
                 "controller_url": self._get_controller_base(),
                 "use_builtin_core": self.config.get("use_builtin_core", False)
             }
         })
-
-    # 注意：下面这些方法需要你从之前的版本完整复制过来，只是内部调用 _get_controller_base() 和 _get_headers() 即可
-    # 为避免重复，这里只保留框架。实际交付时会包含完整实现。
 
     async def _check_proxy(self) -> dict:
         proxy = self.config.get("proxy_url", "http://127.0.0.1:7890")
@@ -498,27 +679,32 @@ class ClashProxyPlugin(Star):
         except Exception as e:
             return 0, str(e)
 
-    async def _push_payload(self, content: str) -> Dict[str, Any]:
+    async def _push_payload(self, content: str, source_name: Optional[str] = None) -> Dict[str, Any]:
         await self._ensure_local_geodata()
-        status, text = await self._put_config(self._patch_geox(content))
+        merged = self._merge_runtime_keys(self._patch_geox(content))
+        self._write_core_config(merged)
+        if source_name:
+            self._set_last_applied(source_name)
+        status, text = await self._put_config(merged)
         if status in (200, 204):
-            return {"ok": True, "pushed": True, "message": "已保存并推送到 Clash"}
+            return {"ok": True, "pushed": True, "message": "已写入磁盘并推送到 Clash，重启后仍会保留节点"}
         need_fallback = status == 400 and any(
             key in text for key in ("MMDB", "GeoIP", "GeoSite", "geosite", "geoip")
         )
         if need_fallback:
             logger.warning(f"[ClashProxy] 地理库下载失败，去掉 GEOIP/GEOSITE 后重试: {text[:180]}")
-            status2, text2 = await self._put_config(self._patch_geox(self._strip_geo_rules(content)))
+            stripped = self._merge_runtime_keys(self._patch_geox(self._strip_geo_rules(content)))
+            status2, text2 = await self._put_config(stripped)
             if status2 in (200, 204):
                 return {
                     "ok": True,
                     "pushed": True,
-                    "message": "已推送。GeoIP 数据库下载超时，已暂时去掉 GEOIP/GEOSITE 规则，其余规则仍生效",
+                    "message": "已推送并写盘。GeoIP 数据库下载超时，运行中暂时去掉 GEOIP/GEOSITE 规则；完整配置仍在磁盘，地理库就绪后重载即可恢复",
                 }
-            return {"ok": True, "pushed": False, "message": f"已保存，但推送失败 HTTP {status2}: {text2[:300]}"}
+            return {"ok": True, "pushed": False, "message": f"已写盘，但推送失败 HTTP {status2}: {text2[:300]}"}
         if status == 0:
-            return {"ok": True, "pushed": False, "message": f"已保存，但推送异常: {text}"}
-        return {"ok": True, "pushed": False, "message": f"已保存，但推送失败 HTTP {status}: {text[:300]}"}
+            return {"ok": True, "pushed": False, "message": f"已写盘，但推送异常: {text}"}
+        return {"ok": True, "pushed": False, "message": f"已写盘，但推送失败 HTTP {status}: {text[:300]}"}
 
     async def api_list_configs(self):
         files = []
@@ -579,7 +765,7 @@ class ClashProxyPlugin(Star):
             target.write_text(content, encoding="utf-8")
             push = {"pushed": False, "message": "已保存"}
             if auto_push:
-                push = await self._push_payload(content)
+                push = await self._push_payload(content, source_name=safe_name)
             result = {
                 "ok": True,
                 "filename": safe_name,
@@ -606,7 +792,7 @@ class ClashProxyPlugin(Star):
         if not file_path.exists():
             return error_response("文件不存在")
         content = file_path.read_text(encoding="utf-8", errors="ignore")
-        result = await self._push_payload(content)
+        result = await self._push_payload(content, source_name=filename)
         if result.get("pushed"):
             return json_response(result)
         return error_response(result.get("message", "推送失败"))

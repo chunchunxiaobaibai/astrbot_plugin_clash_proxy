@@ -5,7 +5,7 @@ desc: |
   提供状态检查、订阅添加/列表/更新等功能。
   下载的订阅文件保存在插件数据目录中。
 short_desc: Clash 代理管理与订阅导入插件
-version: 1.4.2
+version: 1.4.3
 author: pan xie
 repo: https://github.com/chunchunxiaobaibai/astrbot_plugin_clash_proxy
 astrbot_version: ">=4.0"

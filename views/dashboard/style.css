@@ -50,6 +50,7 @@ h1 { margin: 0 0 4px; font-size: 1.6rem; }
   gap: 12px;
   margin-bottom: 12px;
 }
+.status-item.persist { grid-column: 1 / -1; }
 .status-item {
   padding: 12px;
   border-radius: 8px;
