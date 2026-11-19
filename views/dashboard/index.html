@@ -10,7 +10,7 @@
   <div class="container">
     <header>
       <h1>Clash Proxy 管理面板</h1>
-      <p class="subtitle">把完整 YAML 粘贴到下方文本框。推送成功后会写入磁盘，AstrBot 重启后节点仍会保留。</p>
+      <p class="subtitle">应用订阅或粘贴 Clash/Mihomo YAML，然后在策略组中选择节点。</p>
     </header>
 
     <section class="card">
@@ -27,16 +27,17 @@
 
     <section class="card">
       <h2>订阅管理</h2>
+      <p id="applied-config" class="applied-config" role="status">正在读取应用记录…</p>
       <div class="sub-form">
-        <input id="sub-url" type="text" placeholder="输入订阅链接 (http/https)" />
+        <input id="sub-url" type="url" aria-label="订阅链接" placeholder="输入 Clash/Mihomo 订阅链接" />
         <button id="btn-add-sub" class="btn primary">添加订阅</button>
       </div>
       <div id="subs-list"></div>
       <div class="actions">
-        <button id="btn-update-subs" class="btn">更新所有订阅</button>
+        <button id="btn-update-subs" class="btn">更新订阅缓存</button>
         <button id="btn-refresh-subs" class="btn">刷新列表</button>
       </div>
-      <div id="sub-message" class="message"></div>
+      <div id="sub-message" class="message" role="status"></div>
     </section>
 
     <section class="card">

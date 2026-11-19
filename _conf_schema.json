@@ -24,7 +24,7 @@
     "hint": "留空则自动生成"
   },
   "proxy_url": {
-    "description": "代理地址（用于测试连通性）",
+    "description": "代理地址（外部模式时使用，用于测试连通性）",
     "type": "string",
     "default": "http://127.0.0.1:7890",
     "hint": "例如 http://127.0.0.1:7890"

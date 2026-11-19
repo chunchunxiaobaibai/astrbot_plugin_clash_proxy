@@ -13,12 +13,15 @@ import sys
 import platform
 import asyncio
 import gzip
+import hashlib
 import shutil
 import secrets
 from typing import List, Optional, Dict, Any, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 PLUGIN_NAME = "astrbot_plugin_clash_proxy"
+SUBSCRIPTION_CACHE_DIR = "downloads"
+MAX_SUBSCRIPTION_BYTES = 8 * 1024 * 1024
 MIHOMO_VERSION = "v1.19.33"
 MIHOMO_DOWNLOAD_BASE = f"https://github.com/MetaCubeX/mihomo/releases/download/{MIHOMO_VERSION}"
 GEOX_SNIPPET = """
@@ -89,9 +92,11 @@ class ClashProxyPlugin(Star):
         self.plugin_name = PLUGIN_NAME
         self.data_dir = Path(get_astrbot_data_path()) / "plugin_data" / self.plugin_name
         self.subs_dir = self.data_dir / "subs"
+        self.subscription_cache_dir = self.subs_dir / SUBSCRIPTION_CACHE_DIR
         self.bin_dir = self.data_dir / "bin"
         self.config_dir = self.data_dir / "core"
         self.subs_dir.mkdir(parents=True, exist_ok=True)
+        self.subscription_cache_dir.mkdir(parents=True, exist_ok=True)
         self.bin_dir.mkdir(parents=True, exist_ok=True)
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.subs_index_file = self.data_dir / "subscriptions.json"
@@ -99,6 +104,7 @@ class ClashProxyPlugin(Star):
         self.core_config_file = self.config_dir / "config.yaml"
         self.core_process: Optional[asyncio.subprocess.Process] = None
         self._core_lock = asyncio.Lock()
+        self._subscriptions_lock = asyncio.Lock()
         self._paste_chunks: Dict[str, Dict[str, Any]] = {}
         self._stop_requested = False
         self._user_stopped = False
@@ -111,6 +117,7 @@ class ClashProxyPlugin(Star):
         context.register_web_api(f"/{PLUGIN_NAME}/subscriptions", self.api_get_subs, ["GET"], "获取订阅列表")
         context.register_web_api(f"/{PLUGIN_NAME}/subscriptions/add", self.api_add_sub, ["POST"], "添加订阅")
         context.register_web_api(f"/{PLUGIN_NAME}/subscriptions/remove", self.api_remove_sub, ["POST"], "删除订阅")
+        context.register_web_api(f"/{PLUGIN_NAME}/subscriptions/select", self.api_select_sub, ["POST"], "应用订阅")
         context.register_web_api(f"/{PLUGIN_NAME}/subscriptions/update", self.api_update_subs, ["POST"], "更新订阅")
         context.register_web_api(f"/{PLUGIN_NAME}/configs/list", self.api_list_configs, ["GET"], "列出本地配置")
         context.register_web_api(f"/{PLUGIN_NAME}/configs/reload", self.api_reload_config, ["POST"], "推送配置到 Clash")
@@ -297,15 +304,19 @@ class ClashProxyPlugin(Star):
     def _get_last_applied(self) -> str:
         return str(self._load_state().get("last_applied") or "")
 
+    def _applied_target(self) -> str:
+        if self.config.get("use_builtin_core", False):
+            return "builtin"
+        return self._get_controller_base()
+
     def _set_last_applied(self, filename: str):
-        if filename:
-            self._save_state({"last_applied": filename})
+        self._save_state({"last_applied": filename, "last_applied_target": self._applied_target()})
 
     def _find_restore_source(self) -> Optional[Path]:
         name = self._get_last_applied()
         if name:
             path = self.subs_dir / name
-            if path.exists() and path.stat().st_size > 50:
+            if config_has_nodes(self._load_yaml_file(path)):
                 return path
         candidates = sorted(
             list(self.subs_dir.glob("*.yaml")) + list(self.subs_dir.glob("*.yml")),
@@ -331,7 +342,7 @@ class ClashProxyPlugin(Star):
         if source:
             raw = source.read_text(encoding="utf-8", errors="ignore")
             self._write_core_config(self._merge_runtime_keys(self._patch_geox(raw)))
-            self._set_last_applied(source.name)
+            self._set_last_applied(source.relative_to(self.subs_dir).as_posix())
             logger.info(f"[ClashProxy] 已从 {source.name} 恢复核心配置")
             return
 
@@ -348,6 +359,8 @@ class ClashProxyPlugin(Star):
             "profile": {"store-selected": True},
         }
         self._write_core_config(dump_yaml(minimal))
+        if self._load_state().get("last_applied_target") == "builtin":
+            self._set_last_applied("")
         logger.info(f"[ClashProxy] 已生成最小配置: {self.core_config_file}")
 
     async def _start_core(self) -> Dict[str, Any]:
@@ -472,8 +485,7 @@ class ClashProxyPlugin(Star):
         return error_response(result.get("message", "重启失败"))
 
     async def api_status(self):
-        proxy = await self._check_proxy()
-        controller = await self._check_controller()
+        proxy, controller = await asyncio.gather(self._check_proxy(), self._check_controller())
         core = {
             "enabled": self.config.get("use_builtin_core", False),
             "running": self.core_process is not None and self.core_process.returncode is None
@@ -488,14 +500,20 @@ class ClashProxyPlugin(Star):
                 "config_file": str(self.core_config_file),
             },
             "config": {
-                "proxy_url": self.config.get("proxy_url"),
+                "proxy_url": proxy["url"],
                 "controller_url": self._get_controller_base(),
                 "use_builtin_core": self.config.get("use_builtin_core", False)
             }
         })
 
+    def _get_proxy_url(self) -> str:
+        if self.config.get("use_builtin_core", False):
+            port = int(self.config.get("builtin_mixed_port", 7890))
+            return f"http://127.0.0.1:{port}"
+        return self.config.get("proxy_url", "http://127.0.0.1:7890")
+
     async def _check_proxy(self) -> dict:
-        proxy = self.config.get("proxy_url", "http://127.0.0.1:7890")
+        proxy = self._get_proxy_url()
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -510,17 +528,27 @@ class ClashProxyPlugin(Star):
 
     async def _check_controller(self) -> dict:
         base = self._get_controller_base()
+        headers = self._get_headers()
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{base}/version",
-                    headers=self._get_headers(),
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=5)
                 ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return {"ok": True, "url": base, "version": data.get("version", "unknown")}
-                    return {"ok": False, "url": base, "message": f"HTTP {resp.status}"}
+                    if resp.status != 200:
+                        return {"ok": False, "url": base, "message": f"HTTP {resp.status}"}
+                    version = (await resp.json()).get("version", "unknown")
+                mode = None
+                try:
+                    async with session.get(
+                        f"{base}/configs", headers=headers, timeout=aiohttp.ClientTimeout(total=3)
+                    ) as resp:
+                        if resp.status == 200:
+                            mode = (await resp.json()).get("mode")
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, AttributeError):
+                    pass
+                return {"ok": True, "url": base, "version": version, "mode": mode}
         except Exception as e:
             return {"ok": False, "url": base, "message": str(e)}
 
@@ -576,7 +604,7 @@ class ClashProxyPlugin(Star):
 
     async def _save_subscriptions(self, subs: List[str]):
         data = {"subscriptions": subs}
-        self.subs_index_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._write_text_atomic(self.subs_index_file, json.dumps(data, ensure_ascii=False, indent=2))
         self.config["subscriptions"] = subs
 
     async def _get_subscriptions(self) -> List[str]:
@@ -590,36 +618,115 @@ class ClashProxyPlugin(Star):
 
     async def api_get_subs(self):
         subs = await self._get_subscriptions()
-        return json_response({"subscriptions": subs, "count": len(subs)})
+        state = self._load_state()
+        source = state.get("last_applied")
+        applied = None
+        if source and state.get("last_applied_target") == self._applied_target():
+            if source.startswith(f"{SUBSCRIPTION_CACHE_DIR}/"):
+                url = next((url for url in subs if self._subscription_source(url) == source), None)
+                applied = {"kind": "subscription", "url": url}
+            else:
+                applied = {"kind": "local", "name": source}
+        return json_response({
+            "subscriptions": subs,
+            "count": len(subs),
+            "applied": applied,
+            "builtin": self.config.get("use_builtin_core", False),
+            "running": self.core_process is not None and self.core_process.returncode is None,
+        })
 
     async def api_add_sub(self):
         try:
             payload = await request.json(default={})
             url = str(payload.get("url", "")).strip()
-            if not url.startswith(("http://", "https://")):
+            parsed = urlsplit(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
                 return error_response("请提供有效的订阅 URL")
-            subs = await self._get_subscriptions()
-            if url in subs:
-                return error_response("该订阅已存在")
-            subs.append(url)
-            await self._save_subscriptions(subs)
-            return json_response({"ok": True, "count": len(subs)})
+            async with self._subscriptions_lock:
+                subs = await self._get_subscriptions()
+                if url in subs:
+                    return error_response("该订阅已存在")
+                await self._save_subscriptions([*subs, url])
+            return json_response({"ok": True, "count": len(subs) + 1})
+        except ValueError:
+            return error_response("请提供有效的订阅 URL")
         except Exception as e:
             return error_response(str(e))
 
     async def api_remove_sub(self):
         payload = await request.json(default={})
-        index = payload.get("index")
-        subs = await self._get_subscriptions()
-        if index is None or not isinstance(index, int) or index < 0 or index >= len(subs):
-            return error_response("序号无效")
-        removed = subs.pop(index)
-        await self._save_subscriptions(subs)
+        async with self._subscriptions_lock:
+            subs = list(await self._get_subscriptions())
+            url = payload.get("url")
+            index = payload.get("index")
+            if url is not None:
+                if url not in subs:
+                    return error_response("订阅不存在，请刷新列表")
+                index = subs.index(url)
+            if type(index) is not int or not 0 <= index < len(subs):
+                return error_response("序号无效")
+            removed = subs.pop(index)
+            await self._save_subscriptions(subs)
         return json_response({"ok": True, "removed": removed})
 
+    def _subscription_source(self, url: str) -> str:
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        return f"{SUBSCRIPTION_CACHE_DIR}/{digest}.yaml"
+
+    async def _download_subscription(self, session: aiohttp.ClientSession, url: str) -> str:
+        try:
+            async with session.get(url, headers={"User-Agent": "ClashForAndroid/2.5.12"}) as resp:
+                if resp.status != 200:
+                    raise ValueError(f"订阅下载失败（HTTP {resp.status}）")
+                content = bytearray()
+                async for chunk in resp.content.iter_chunked(65536):
+                    content.extend(chunk)
+                    if len(content) > MAX_SUBSCRIPTION_BYTES:
+                        raise ValueError("订阅文件超过 8 MiB")
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            raise ValueError("无法下载订阅，请检查链接和 AstrBot 所在环境的网络") from None
+
+        try:
+            text = content.decode("utf-8-sig")
+            if config_has_nodes(yaml.safe_load(text)):
+                self._write_text_atomic(self.subs_dir / self._subscription_source(url), text)
+                return text
+        except (UnicodeError, yaml.YAMLError):
+            pass
+        raise ValueError("订阅需返回包含节点或代理提供者的 Clash/Mihomo YAML")
+
+    async def api_select_sub(self):
+        payload = await request.json(default={})
+        url = payload.get("url")
+        async with self._subscriptions_lock:
+            if not isinstance(url, str) or url not in await self._get_subscriptions():
+                return error_response("订阅不存在，请刷新列表")
+            source = self._subscription_source(url)
+            path = self.subs_dir / source
+            try:
+                if config_has_nodes(self._load_yaml_file(path)):
+                    content = path.read_text(encoding="utf-8")
+                else:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                        content = await self._download_subscription(session, url)
+                result = await self._push_payload(content, source_name=source)
+            except (ValueError, OSError) as e:
+                return error_response(str(e))
+        if result.get("pushed"):
+            return json_response(result)
+        return error_response(result["message"])
+
     async def api_update_subs(self):
-        # 实现同前
-        return json_response({"ok": True, "message": "更新功能保留"})
+        async with self._subscriptions_lock:
+            subs = await self._get_subscriptions()
+            failures = []
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                for index, url in enumerate(subs, 1):
+                    try:
+                        await self._download_subscription(session, url)
+                    except (ValueError, OSError) as e:
+                        failures.append({"index": index, "message": str(e)})
+        return json_response({"ok": True, "success": len(subs) - len(failures), "total": len(subs), "failures": failures})
 
     def _patch_geox(self, content: str) -> str:
         if "cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb" in content:
@@ -661,8 +768,10 @@ class ClashProxyPlugin(Star):
     async def _ensure_local_geodata(self):
         if not self.config.get("use_builtin_core", False):
             return
-        for name, urls in GEODATA_FILES.items():
-            await self._download_to(urls, self.config_dir / name)
+        await asyncio.gather(*(
+            self._download_to(urls, self.config_dir / name)
+            for name, urls in GEODATA_FILES.items()
+        ))
 
     async def _put_config(self, content: str):
         base = self._get_controller_base()
@@ -679,38 +788,40 @@ class ClashProxyPlugin(Star):
         except Exception as e:
             return 0, str(e)
 
-    async def _push_payload(self, content: str, source_name: Optional[str] = None) -> Dict[str, Any]:
-        await self._ensure_local_geodata()
-        merged = self._merge_runtime_keys(self._patch_geox(content))
-        self._write_core_config(merged)
-        if source_name:
+    async def _push_payload(self, content: str, source_name: str) -> Dict[str, Any]:
+        async with self._core_lock:
+            if self.config.get("use_builtin_core", False) and (
+                self.core_process is None or self.core_process.returncode is not None
+            ):
+                return {"ok": False, "pushed": False, "message": "内置 Mihomo 未运行，请启动后重试"}
+
+            if any(key in content.upper() for key in ("GEOIP,", "GEOSITE,")):
+                await self._ensure_local_geodata()
+            merged = self._merge_runtime_keys(self._patch_geox(content))
+            status, text = await self._put_config(merged)
+            message = "已应用配置"
+            need_fallback = status == 400 and any(
+                key in text.lower() for key in ("mmdb", "geoip", "geosite")
+            )
+            if need_fallback:
+                logger.warning("[ClashProxy] 地理库加载失败，去掉 GEOIP/GEOSITE 规则后重试")
+                stripped = self._merge_runtime_keys(self._patch_geox(self._strip_geo_rules(content)))
+                status, text = await self._put_config(stripped)
+                message = "已应用配置，运行中暂时跳过 GEOIP/GEOSITE 规则。地理库就绪后可重新应用完整配置"
+            if status not in (200, 204):
+                detail = f"HTTP {status}: {text[:300]}" if status else text
+                return {"ok": False, "pushed": False, "message": f"应用失败: {detail}"}
+
+            self._write_core_config(merged)
             self._set_last_applied(source_name)
-        status, text = await self._put_config(merged)
-        if status in (200, 204):
-            return {"ok": True, "pushed": True, "message": "已写入磁盘并推送到 Clash，重启后仍会保留节点"}
-        need_fallback = status == 400 and any(
-            key in text for key in ("MMDB", "GeoIP", "GeoSite", "geosite", "geoip")
-        )
-        if need_fallback:
-            logger.warning(f"[ClashProxy] 地理库下载失败，去掉 GEOIP/GEOSITE 后重试: {text[:180]}")
-            stripped = self._merge_runtime_keys(self._patch_geox(self._strip_geo_rules(content)))
-            status2, text2 = await self._put_config(stripped)
-            if status2 in (200, 204):
-                return {
-                    "ok": True,
-                    "pushed": True,
-                    "message": "已推送并写盘。GeoIP 数据库下载超时，运行中暂时去掉 GEOIP/GEOSITE 规则；完整配置仍在磁盘，地理库就绪后重载即可恢复",
-                }
-            return {"ok": True, "pushed": False, "message": f"已写盘，但推送失败 HTTP {status2}: {text2[:300]}"}
-        if status == 0:
-            return {"ok": True, "pushed": False, "message": f"已写盘，但推送异常: {text}"}
-        return {"ok": True, "pushed": False, "message": f"已写盘，但推送失败 HTTP {status}: {text[:300]}"}
+            return {"ok": True, "pushed": True, "message": message}
 
     async def api_list_configs(self):
         files = []
         if self.subs_dir.exists():
-            for p in sorted(self.subs_dir.glob("*.yaml")):
-                files.append({"name": p.name, "size": p.stat().st_size})
+            for p in sorted(self.subs_dir.iterdir()):
+                if p.is_file() and p.suffix.lower() in (".yaml", ".yml"):
+                    files.append({"name": p.name, "size": p.stat().st_size})
         return json_response({"files": files})
 
     async def api_import_paste_chunk(self):
@@ -772,7 +883,7 @@ class ClashProxyPlugin(Star):
                 "size": len(content),
                 "has_proxies": isinstance(data.get("proxies"), list),
                 "pushed": push.get("pushed", False),
-                "message": push.get("message", "已保存"),
+                "message": f"已保存。{push['message']}" if auto_push else "已保存",
             }
             logger.info(f"[ClashProxy] 粘贴导入完成: {safe_name} size={len(content)} pushed={result['pushed']}")
             return json_response(result)
@@ -786,10 +897,14 @@ class ClashProxyPlugin(Star):
     async def api_reload_config(self):
         payload = await request.json(default={})
         filename = payload.get("filename")
-        if not filename:
-            return error_response("请提供 filename")
+        if (
+            not isinstance(filename, str)
+            or not filename.lower().endswith((".yaml", ".yml"))
+            or any(not (c.isalnum() or c in "._-") for c in filename)
+        ):
+            return error_response("配置文件名无效")
         file_path = self.subs_dir / filename
-        if not file_path.exists():
+        if not file_path.is_file():
             return error_response("文件不存在")
         content = file_path.read_text(encoding="utf-8", errors="ignore")
         result = await self._push_payload(content, source_name=filename)

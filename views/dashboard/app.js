@@ -1,4 +1,5 @@
 const bridge = window.AstrBotPluginView;
+const modeNames = { rule: "规则", global: "全局", direct: "直连" };
 
 async function init() {
   try {
@@ -43,16 +44,17 @@ async function refreshStatus() {
     const c = data.controller || {};
     const persist = data.persist || {};
     const persistClass = persist.has_nodes ? "ok" : "";
-    const lastApplied = persist.last_applied ? `<br>上次配置: ${escapeHtml(persist.last_applied)}` : "";
+    const mode = c.mode ? modeNames[c.mode.toLowerCase()] || c.mode : "未知";
+    const modeLine = c.ok ? `<br>转发模式：${escapeHtml(mode)}` : "";
     el.innerHTML = `
       <div class="status-item ${p.ok ? "ok" : "error"}">
-        <strong>代理</strong><br>${escapeHtml(p.url || "-")}<br>${escapeHtml(p.message || (p.ok ? "可用" : "不可用"))}
+        <strong>应用代理地址</strong><br>${escapeHtml(p.url || "-")}<br>${escapeHtml(p.message || (p.ok ? "可用" : "不可用"))}
       </div>
       <div class="status-item ${c.ok ? "ok" : "error"}">
-        <strong>控制器</strong><br>${escapeHtml(c.url || "-")}<br>${escapeHtml(c.version || c.message || (c.ok ? "可用" : "不可用"))}
+        <strong>控制器</strong><br>${escapeHtml(c.url || "-")}<br>${escapeHtml(c.version || c.message || (c.ok ? "可用" : "不可用"))}${modeLine}
       </div>
       <div class="status-item persist ${persistClass}">
-        <strong>持久配置</strong><br>推送到 Clash 时会写入磁盘，重启后仍保留节点${lastApplied}
+        <strong>本地配置备份</strong><br>${persist.has_nodes ? "已保存节点配置" : "暂无节点配置"}
       </div>
     `;
   } catch (e) {
@@ -128,31 +130,67 @@ async function selectNode(group, node, selectEl) {
 
 async function refreshSubs() {
   const el = document.getElementById("subs-list");
-  if (!el) return;
+  const current = document.getElementById("applied-config");
   try {
     const data = await bridge.apiGet("subscriptions");
     const subs = data.subscriptions || [];
+    const applied = data.applied;
+    const label = !data.builtin ? "面板最后应用" : data.running ? "当前配置" : "内置核心已保存（未运行）";
+    const source = applied?.kind === "subscription"
+      ? applied.url || "已从列表删除的订阅"
+      : applied?.name || "暂无应用记录";
+    current.textContent = `${label}：${source}`;
     if (subs.length === 0) {
       el.innerHTML = `<div class="muted">暂无订阅</div>`;
       return;
     }
-    el.innerHTML = subs.map((url, i) => `
-      <div class="sub-item">
-        <span class="sub-url">${escapeHtml(url)}</span>
-        <button class="btn danger small" data-index="${i}">删除</button>
+    el.innerHTML = subs.map((url, i) => {
+      const active = url === applied?.url;
+      const activeLabel = data.builtin && data.running ? "当前订阅" : "已应用";
+      return `
+      <div class="sub-item" data-index="${i}">
+        <div class="sub-url">
+          ${active ? `<strong class="sub-active">${activeLabel}</strong>` : ""}
+          <span>${escapeHtml(url)}</span>
+        </div>
+        <div class="sub-item-actions">
+          <button class="btn primary small" data-action="apply">${active ? "重新应用" : "应用"}</button>
+          <button class="btn danger small" data-action="remove">删除</button>
+        </div>
       </div>
-    `).join("");
-    el.querySelectorAll(".sub-item button").forEach(btn => {
-      btn.addEventListener("click", async () => {
-        const index = parseInt(btn.dataset.index, 10);
-        if (confirm("确认删除该订阅？")) {
-          await removeSub(index);
-        }
+    `;
+    }).join("");
+    el.querySelectorAll(".sub-item").forEach(row => {
+      const url = subs[Number(row.dataset.index)];
+      const apply = row.querySelector('[data-action="apply"]');
+      const remove = row.querySelector('[data-action="remove"]');
+      apply.addEventListener("click", () => applySub(url, apply));
+      remove.addEventListener("click", () => {
+        if (confirm("确认删除该订阅？")) removeSub(url);
       });
     });
   } catch (e) {
     console.error("[ClashProxy] subs list error", e);
+    current.textContent = "";
     el.innerHTML = `<div class="error">加载订阅失败: ${escapeHtml(e.message || String(e))}</div>`;
+  }
+}
+
+async function applySub(url, button) {
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "应用中…";
+  showMsg("正在加载订阅并应用到 Mihomo…");
+  try {
+    const res = await bridge.apiPost("subscriptions/select", { url });
+    if (!res?.pushed) throw new Error(res?.message || "应用失败");
+    showMsg(res.message || "已应用订阅");
+    await Promise.allSettled([refreshSubs(), refreshProxies(), refreshStatus()]);
+  } catch (e) {
+    showMsg(e.message || String(e), true);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
   }
 }
 
@@ -177,7 +215,6 @@ async function addSub() {
   showMsg("正在添加...");
 
   try {
-    console.log("[ClashProxy] Adding sub", url);
     const res = await bridge.apiPost("subscriptions/add", { url });
     console.log("[ClashProxy] Add response", res);
     if (res && res.ok) {
@@ -199,9 +236,9 @@ async function addSub() {
   }
 }
 
-async function removeSub(index) {
+async function removeSub(url) {
   try {
-    const res = await bridge.apiPost("subscriptions/remove", { index });
+    const res = await bridge.apiPost("subscriptions/remove", { url });
     if (res && res.ok) {
       showMsg("已删除");
       await refreshSubs();
@@ -215,14 +252,15 @@ async function removeSub(index) {
 }
 
 async function updateSubs() {
-  showMsg("正在更新所有订阅...");
+  showMsg("正在下载订阅配置…");
   const btn = document.getElementById("btn-update-subs");
   if (btn) btn.disabled = true;
   try {
     const res = await bridge.apiPost("subscriptions/update", {});
     if (res && res.ok) {
-      showMsg(`更新完成: ${res.success}/${res.total} 成功`);
-      await refreshConfigs();
+      const failures = (res.failures || []).map(f => `第 ${f.index} 条：${f.message}`).join("。");
+      const summary = `已下载 ${res.success}/${res.total} 条。点击「应用」或「重新应用」加载配置。`;
+      showMsg(failures ? `${summary} ${failures}` : summary, Boolean(failures));
     } else {
       showMsg(res?.message || "更新失败", true);
     }
@@ -273,8 +311,8 @@ async function reloadConfig(filename, btn) {
     const res = await bridge.apiPost("configs/reload", { filename });
     console.log("[ClashProxy] reload response", res);
     if (res && res.ok) {
-      showConfigMsg(`推送成功！节点 ${res.proxies || "?"} 个，策略组 ${res.groups || "?"} 个`);
-      await refreshProxies();
+      showConfigMsg(res.message || "已应用配置");
+      await Promise.allSettled([refreshSubs(), refreshProxies(), refreshStatus()]);
     } else {
       const msg = res?.message || res?.error || JSON.stringify(res);
       showConfigMsg("推送失败: " + msg, true);
@@ -340,7 +378,7 @@ async function importPaste(autoPush) {
       let msg = res.message || "操作完成";
       if (res.pushed) {
         msg += "，节点已更新";
-        await refreshProxies();
+        await Promise.allSettled([refreshSubs(), refreshProxies(), refreshStatus()]);
       }
       const failed = msg.indexOf("失败") >= 0 || msg.indexOf("异常") >= 0;
       showConfigMsg(msg, failed);
