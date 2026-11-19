@@ -9,19 +9,58 @@ const yamlStatus = {
 
 async function init() {
   try {
-    await bridge.ready();
-    console.log("[ClashProxy] Bridge ready", bridge.getContext?.());
-    document.title = "Clash Proxy 管理";
+    const context = await bridge.ready();
+    setTheme(context || bridge.getContext?.());
+    bridge.onContext?.(setTheme);
+    bindNavigation();
     bindEvents();
     await refreshAll();
   } catch (e) {
     console.error("[ClashProxy] Init failed", e);
-    document.body.innerHTML = `<div style="padding:20px;color:red">初始化失败: ${e.message || e}</div>`;
+    document.getElementById("status").textContent = `初始化失败：${e.message || e}`;
   }
 }
 
+function setTheme(context) {
+  document.documentElement.dataset.theme = context?.isDark ? "dark" : "light";
+}
+
+function bindNavigation() {
+  const navigation = document.querySelector(".navigation");
+  const tabs = [...navigation.querySelectorAll('[role="tab"]')];
+
+  function activateTab(active) {
+    for (const tab of tabs) {
+      const selected = tab === active;
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+      document.getElementById(tab.getAttribute("aria-controls")).hidden = !selected;
+    }
+    window.scrollTo(0, 0);
+  }
+
+  for (const tab of tabs) {
+    tab.addEventListener("click", () => activateTab(tab));
+  }
+  navigation.addEventListener("keydown", event => {
+    const current = tabs.indexOf(event.target);
+    const steps = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 };
+    if (current === -1) return;
+    let next;
+    if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    else if (steps[event.key]) next = (current + steps[event.key] + tabs.length) % tabs.length;
+    else return;
+    event.preventDefault();
+    activateTab(tabs[next]);
+    tabs[next].focus();
+  });
+}
+
 function bindEvents() {
-  document.getElementById("btn-refresh-status")?.addEventListener("click", refreshStatus);
+  document.getElementById("btn-refresh-status")?.addEventListener("click", () =>
+    Promise.allSettled([refreshStatus(), refreshConfigs()])
+  );
   document.getElementById("btn-refresh-proxies")?.addEventListener("click", refreshProxies);
   document.getElementById("btn-refresh-subs")?.addEventListener("click", refreshSubs);
   document.getElementById("btn-add-sub")?.addEventListener("click", addSub);
@@ -30,11 +69,6 @@ function bindEvents() {
   document.getElementById("btn-import-save-only")?.addEventListener("click", () => importPaste(false));
   document.getElementById("btn-refresh-configs")?.addEventListener("click", refreshConfigs);
   document.getElementById("group-filter").addEventListener("input", filterGroups);
-  const yamlFile = document.getElementById("yaml-file");
-  yamlFile.addEventListener("change", () => {
-    if (yamlFile.files[0]) document.getElementById("yaml-name").value = yamlFile.files[0].name;
-  });
-  document.getElementById("yaml-paste").addEventListener("input", () => { yamlFile.value = ""; });
 
   // 回车也触发添加
   document.getElementById("sub-url")?.addEventListener("keydown", (e) => {
@@ -55,18 +89,29 @@ async function refreshStatus() {
     const p = data.proxy || {};
     const c = data.controller || {};
     const persist = data.persist || {};
-    const persistClass = persist.has_nodes ? "ok" : "";
-    const mode = c.mode ? modeNames[c.mode.toLowerCase()] || c.mode : "未知";
-    const modeLine = c.ok ? `<br>转发模式：${escapeHtml(mode)}` : "";
+    const mode = modeNames[c.mode] || c.mode || "未知";
+    const controllerDetail = c.ok ? `转发模式：${mode}` : c.message;
     el.innerHTML = `
-      <div class="status-item ${p.ok ? "ok" : "error"}">
-        <strong>应用代理地址</strong><br>${escapeHtml(p.url || "-")}<br>${escapeHtml(p.message || (p.ok ? "可用" : "不可用"))}
+      <div class="status-item">
+        <div class="status-heading">
+          <strong>应用代理地址</strong>
+          <span class="badge ${p.ok ? "ok" : "error"}">${p.ok ? "可用" : "不可用"}</span>
+        </div>
+        <code class="status-address">${escapeHtml(p.url || "—")}</code>
+        ${!p.ok && p.message ? `<div class="status-meta error">${escapeHtml(p.message)}</div>` : ""}
       </div>
-      <div class="status-item ${c.ok ? "ok" : "error"}">
-        <strong>控制器</strong><br>${escapeHtml(c.url || "-")}<br>${escapeHtml(c.version || c.message || (c.ok ? "可用" : "不可用"))}${modeLine}
+      <div class="status-item">
+        <div class="status-heading">
+          <strong>控制器</strong>
+          <span class="badge ${c.ok ? "ok" : "error"}">${c.ok ? "在线" : "不可用"}</span>
+        </div>
+        <code class="status-address">${escapeHtml(c.url || "—")}</code>
+        ${controllerDetail ? `<div class="status-meta ${c.ok ? "muted" : "error"}">${escapeHtml(controllerDetail)}</div>` : ""}
+        ${c.ok && c.version ? `<div class="status-meta muted">${escapeHtml(c.version)}</div>` : ""}
       </div>
-      <div class="status-item persist ${persistClass}">
-        <strong>本地配置备份</strong><br>${persist.has_nodes ? "已保存节点配置" : "暂无节点配置"}
+      <div class="status-item">
+        <div class="status-heading"><strong>本地配置备份</strong></div>
+        <div class="status-meta muted">${persist.has_nodes ? "已保存节点配置" : "暂无节点配置"}</div>
       </div>
     `;
   } catch (e) {
@@ -326,12 +371,15 @@ async function updateSubs() {
 async function refreshConfigs() {
   const el = document.getElementById("configs-list");
   const active = document.getElementById("yaml-active");
+  const overview = document.getElementById("overview-yaml");
   try {
     const data = await bridge.apiGet("configs/list");
     const files = data.files || [];
     const applied = data.applied;
     const label = applied ? yamlStatus[applied.status] || "应用记录" : "";
-    active.textContent = applied ? `${label}：${applied.filename}` : "暂无本地 YAML 应用记录";
+    const summary = applied ? `${label}：${applied.filename}` : "暂无本地 YAML 应用记录";
+    active.textContent = summary;
+    overview.textContent = summary;
     if (files.length === 0) {
       el.innerHTML = `<div class="muted">暂无本地配置文件</div>`;
       return;
@@ -358,6 +406,7 @@ async function refreshConfigs() {
   } catch (e) {
     console.error("[ClashProxy] configs list error", e);
     active.textContent = "暂时无法读取 YAML 应用记录";
+    overview.textContent = active.textContent;
     el.innerHTML = `<div class="error">加载配置列表失败</div>`;
   }
 }
@@ -390,10 +439,14 @@ async function reloadConfig(filename, btn) {
 
 async function importPaste(autoPush) {
   const textarea = document.getElementById("yaml-paste");
-  const fileInput = document.getElementById("yaml-file");
+  const content = textarea.value.replace(/^\uFEFF/, "");
+  if (content.trim().length < 50) {
+    showConfigMsg("请粘贴完整的 Clash/Mihomo YAML 配置", true);
+    textarea.focus();
+    return;
+  }
   const nameInput = document.getElementById("yaml-name");
-  const file = fileInput.files[0];
-  const filename = nameInput.value.trim() || file?.name || "pasted.yaml";
+  const filename = nameInput.value.trim() || "pasted.yaml";
   const pushButton = document.getElementById("btn-import-paste");
   const saveButton = document.getElementById("btn-import-save-only");
   const btn = autoPush ? pushButton : saveButton;
@@ -404,11 +457,6 @@ async function importPaste(autoPush) {
   btn.textContent = "传输中…";
 
   try {
-    const content = (file ? await file.text() : textarea.value).replace(/^\uFEFF/, "");
-    if (content.trim().length < 50) {
-      showConfigMsg("请选择 YAML 文件或粘贴完整的 Clash/Mihomo 配置", true);
-      return;
-    }
     const CHUNK = 80000;
     const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     const total = Math.ceil(content.length / CHUNK);
@@ -436,7 +484,6 @@ async function importPaste(autoPush) {
     if (res && res.ok) {
       showConfigMsg(`${res.filename || filename} · ${res.message || "已保存"}`, autoPush && !res.pushed);
       textarea.value = "";
-      fileInput.value = "";
       nameInput.value = "pasted.yaml";
       if (res.pushed) await refreshAll();
       else await refreshConfigs();

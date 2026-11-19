@@ -7,65 +7,84 @@
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
-  <div class="container">
-    <header>
-      <h1>Clash Proxy 管理面板</h1>
-    </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <header class="brand">
+        <span class="brand-mark" aria-hidden="true"><span></span></span>
+        <h1>Clash Proxy</h1>
+      </header>
+      <div class="navigation" role="tablist" aria-label="管理面板" aria-orientation="vertical">
+        <button type="button" id="tab-status" role="tab" aria-controls="panel-status" aria-selected="true">运行概览</button>
+        <button type="button" id="tab-yaml" role="tab" aria-controls="panel-yaml" aria-selected="false" tabindex="-1">YAML 配置</button>
+        <button type="button" id="tab-groups" role="tab" aria-controls="panel-groups" aria-selected="false" tabindex="-1">策略组与节点</button>
+        <button type="button" id="tab-subs" role="tab" aria-controls="panel-subs" aria-selected="false" tabindex="-1">链接订阅</button>
+      </div>
+    </aside>
 
-    <section class="card">
-      <h2>状态</h2>
-      <div id="status" class="status-grid">加载中...</div>
-      <button id="btn-refresh-status" class="btn">刷新状态</button>
-    </section>
+    <main class="content">
+      <section id="panel-status" class="panel" role="tabpanel" aria-labelledby="tab-status" tabindex="0">
+        <div class="panel-header">
+          <h2>运行概览</h2>
+          <button type="button" id="btn-refresh-status" class="btn">刷新状态</button>
+        </div>
+        <div id="status" class="status-grid">加载中…</div>
+        <p id="overview-yaml" class="selection-summary" role="status">正在读取 YAML 应用记录…</p>
+      </section>
 
-    <section class="card">
-      <h2>本地 YAML 配置</h2>
-      <p id="yaml-active" class="selection-summary" role="status">正在读取 YAML 应用记录…</p>
-      <div id="configs-list"></div>
-      <div class="yaml-form">
-        <label for="yaml-file">选择 YAML 文件</label>
-        <input id="yaml-file" type="file" accept=".yaml,.yml" />
-        <details>
-          <summary>粘贴 YAML</summary>
-          <textarea id="yaml-paste" rows="8" aria-label="粘贴 YAML" placeholder="粘贴完整的 Clash/Mihomo YAML"></textarea>
+      <section id="panel-yaml" class="panel" role="tabpanel" aria-labelledby="tab-yaml" tabindex="0" hidden>
+        <div class="panel-header">
+          <h2>YAML 配置</h2>
+          <button type="button" id="btn-refresh-configs" class="btn">刷新配置列表</button>
+        </div>
+        <p id="yaml-active" class="selection-summary" role="status">正在读取 YAML 应用记录…</p>
+        <div class="yaml-form">
+          <label for="yaml-paste">粘贴 YAML</label>
+          <textarea id="yaml-paste" rows="11" spellcheck="false" placeholder="在此粘贴完整的 Clash/Mihomo 配置"></textarea>
+          <label for="yaml-name">保存文件名</label>
+          <input id="yaml-name" type="text" value="pasted.yaml" />
+        </div>
+        <div class="actions">
+          <button type="button" id="btn-import-paste" class="btn primary">保存并推送到 Clash</button>
+          <button type="button" id="btn-import-save-only" class="btn">仅保存</button>
+        </div>
+        <div id="config-message" class="message" role="status"></div>
+        <details class="saved-configs">
+          <summary>已保存的配置</summary>
+          <div id="configs-list">正在读取配置列表…</div>
         </details>
-        <label for="yaml-name">保存文件名</label>
-        <input id="yaml-name" type="text" value="pasted.yaml" />
-      </div>
-      <div class="actions">
-        <button id="btn-import-paste" class="btn primary">保存并推送到 Clash</button>
-        <button id="btn-import-save-only" class="btn">仅保存</button>
-        <button id="btn-refresh-configs" class="btn">刷新配置列表</button>
-      </div>
-      <div id="config-message" class="message" role="status"></div>
-    </section>
+      </section>
 
-    <section class="card">
-      <h2>策略组与节点选择</h2>
-      <p id="route-overview" class="selection-summary" role="status">正在读取转发线路…</p>
-      <div class="group-tools">
-        <input id="group-filter" type="search" aria-label="筛选策略组或已选节点" placeholder="筛选策略组或已选节点" />
-        <button id="btn-refresh-proxies" class="btn">刷新节点列表</button>
-      </div>
-      <div id="groups">加载中...</div>
-      <p id="no-matching-groups" class="muted" hidden>没有匹配的策略组。</p>
-      <div id="node-message" class="message" role="status"></div>
-    </section>
+      <section id="panel-groups" class="panel" role="tabpanel" aria-labelledby="tab-groups" tabindex="0" hidden>
+        <div class="panel-header">
+          <h2>策略组与节点</h2>
+          <button type="button" id="btn-refresh-proxies" class="btn">刷新节点列表</button>
+        </div>
+        <p id="route-overview" class="selection-summary" role="status">正在读取转发线路…</p>
+        <div class="group-tools">
+          <input id="group-filter" type="search" aria-label="筛选策略组或已选节点" placeholder="筛选策略组或已选节点" />
+        </div>
+        <div id="node-message" class="message" role="status"></div>
+        <div id="groups" class="group-grid">加载中…</div>
+        <p id="no-matching-groups" class="muted" hidden>没有匹配的策略组。</p>
+      </section>
 
-    <details class="card">
-      <summary class="section-title">链接订阅</summary>
-      <p id="applied-config" class="applied-config" role="status">正在读取应用记录…</p>
-      <div class="sub-form">
-        <input id="sub-url" type="url" aria-label="订阅链接" placeholder="输入 Clash/Mihomo 订阅链接" />
-        <button id="btn-add-sub" class="btn primary">添加订阅</button>
-      </div>
-      <div id="subs-list"></div>
-      <div class="actions">
-        <button id="btn-update-subs" class="btn">更新订阅缓存</button>
-        <button id="btn-refresh-subs" class="btn">刷新列表</button>
-      </div>
-      <div id="sub-message" class="message" role="status"></div>
-    </details>
+      <section id="panel-subs" class="panel" role="tabpanel" aria-labelledby="tab-subs" tabindex="0" hidden>
+        <div class="panel-header">
+          <h2>链接订阅</h2>
+          <button type="button" id="btn-refresh-subs" class="btn">刷新列表</button>
+        </div>
+        <p id="applied-config" class="selection-summary" role="status">正在读取应用记录…</p>
+        <div class="sub-form">
+          <input id="sub-url" type="url" aria-label="订阅链接" placeholder="输入 Clash/Mihomo 订阅链接" />
+          <button type="button" id="btn-add-sub" class="btn primary">添加订阅</button>
+        </div>
+        <div id="subs-list"></div>
+        <div class="actions">
+          <button type="button" id="btn-update-subs" class="btn">更新订阅缓存</button>
+        </div>
+        <div id="sub-message" class="message" role="status"></div>
+      </section>
+    </main>
   </div>
   <script type="module" src="./app.js"></script>
 </body>
