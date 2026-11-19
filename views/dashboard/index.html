@@ -10,7 +10,6 @@
   <div class="container">
     <header>
       <h1>Clash Proxy 管理面板</h1>
-      <p class="subtitle">应用订阅或粘贴 Clash/Mihomo YAML，然后在策略组中选择节点。</p>
     </header>
 
     <section class="card">
@@ -20,13 +19,41 @@
     </section>
 
     <section class="card">
-      <h2>策略组与节点选择</h2>
-      <div id="groups">加载中...</div>
-      <button id="btn-refresh-proxies" class="btn">刷新节点列表</button>
+      <h2>本地 YAML 配置</h2>
+      <p id="yaml-active" class="selection-summary" role="status">正在读取 YAML 应用记录…</p>
+      <div id="configs-list"></div>
+      <div class="yaml-form">
+        <label for="yaml-file">选择 YAML 文件</label>
+        <input id="yaml-file" type="file" accept=".yaml,.yml" />
+        <details>
+          <summary>粘贴 YAML</summary>
+          <textarea id="yaml-paste" rows="8" aria-label="粘贴 YAML" placeholder="粘贴完整的 Clash/Mihomo YAML"></textarea>
+        </details>
+        <label for="yaml-name">保存文件名</label>
+        <input id="yaml-name" type="text" value="pasted.yaml" />
+      </div>
+      <div class="actions">
+        <button id="btn-import-paste" class="btn primary">保存并推送到 Clash</button>
+        <button id="btn-import-save-only" class="btn">仅保存</button>
+        <button id="btn-refresh-configs" class="btn">刷新配置列表</button>
+      </div>
+      <div id="config-message" class="message" role="status"></div>
     </section>
 
     <section class="card">
-      <h2>订阅管理</h2>
+      <h2>策略组与节点选择</h2>
+      <p id="route-overview" class="selection-summary" role="status">正在读取转发线路…</p>
+      <div class="group-tools">
+        <input id="group-filter" type="search" aria-label="筛选策略组或已选节点" placeholder="筛选策略组或已选节点" />
+        <button id="btn-refresh-proxies" class="btn">刷新节点列表</button>
+      </div>
+      <div id="groups">加载中...</div>
+      <p id="no-matching-groups" class="muted" hidden>没有匹配的策略组。</p>
+      <div id="node-message" class="message" role="status"></div>
+    </section>
+
+    <details class="card">
+      <summary class="section-title">链接订阅</summary>
       <p id="applied-config" class="applied-config" role="status">正在读取应用记录…</p>
       <div class="sub-form">
         <input id="sub-url" type="url" aria-label="订阅链接" placeholder="输入 Clash/Mihomo 订阅链接" />
@@ -38,20 +65,7 @@
         <button id="btn-refresh-subs" class="btn">刷新列表</button>
       </div>
       <div id="sub-message" class="message" role="status"></div>
-    </section>
-
-    <section class="card">
-      <h2>导入配置（粘贴 YAML）</h2>
-      <div class="sub-form">
-        <textarea id="yaml-paste" rows="12" placeholder="在此直接粘贴完整的 Clash YAML 配置内容..." style="width:100%;font-family:monospace;font-size:13px;padding:8px;border:1px solid #ddd;border-radius:4px;resize:vertical;"></textarea>
-      </div>
-      <div class="actions">
-        <button id="btn-import-paste" class="btn primary">保存并推送到 Clash</button>
-        <button id="btn-import-save-only" class="btn">仅保存</button>
-      </div>
-      <div id="configs-list"></div>
-      <div id="config-message" class="message"></div>
-    </section>
+    </details>
   </div>
   <script type="module" src="./app.js"></script>
 </body>

@@ -1,5 +1,11 @@
 const bridge = window.AstrBotPluginView;
 const modeNames = { rule: "规则", global: "全局", direct: "直连" };
+const yamlStatus = {
+  running: "当前 YAML",
+  saved: "已保存到内置核心（未运行）",
+  last_applied: "面板最后推送的 YAML",
+  legacy: "上次记录的 YAML（旧版记录）",
+};
 
 async function init() {
   try {
@@ -23,6 +29,12 @@ function bindEvents() {
   document.getElementById("btn-import-paste")?.addEventListener("click", () => importPaste(true));
   document.getElementById("btn-import-save-only")?.addEventListener("click", () => importPaste(false));
   document.getElementById("btn-refresh-configs")?.addEventListener("click", refreshConfigs);
+  document.getElementById("group-filter").addEventListener("input", filterGroups);
+  const yamlFile = document.getElementById("yaml-file");
+  yamlFile.addEventListener("change", () => {
+    if (yamlFile.files[0]) document.getElementById("yaml-name").value = yamlFile.files[0].name;
+  });
+  document.getElementById("yaml-paste").addEventListener("input", () => { yamlFile.value = ""; });
 
   // 回车也触发添加
   document.getElementById("sub-url")?.addEventListener("keydown", (e) => {
@@ -65,66 +77,107 @@ async function refreshStatus() {
 
 async function refreshProxies() {
   const el = document.getElementById("groups");
-  if (!el) return;
+  const overview = document.getElementById("route-overview");
   el.innerHTML = "加载中...";
+  filterGroups();
   try {
     const data = await bridge.apiGet("proxies");
-    if (!data.ok) {
-      el.innerHTML = `<div class="error">无法获取节点: ${escapeHtml(data.message || "控制器不可用")}</div>`;
-      return;
+    if (!data.ok) throw new Error(data.message || "控制器不可用");
+    const groups = new Map((data.groups || []).map(group => [group.name, group]));
+    if (data.mode === "global") {
+      overview.textContent = groups.has("GLOBAL")
+        ? `全局线路：${groupPath("GLOBAL", groups).join(" → ")}`
+        : "全局模式，控制器未返回 GLOBAL 策略组";
+    } else if (data.mode === "rule") {
+      overview.textContent = "规则模式：不同目标按 YAML 规则选择策略组，下面显示各组的当前选择。";
+    } else {
+      overview.textContent = data.mode === "direct" ? "直连模式：DIRECT" : "转发模式未知";
     }
-    if (!data.groups || data.groups.length === 0) {
-      el.innerHTML = `<div class="muted">未找到策略组。请确认 Clash 已运行且控制器可访问。</div>`;
-      return;
-    }
-    el.innerHTML = data.groups.map(g => renderGroup(g)).join("");
+    el.innerHTML = groups.size
+      ? [...groups.values()].map(g => renderGroup(g, groups)).join("")
+      : '<div class="muted">控制器未返回策略组。</div>';
     el.querySelectorAll(".node-select").forEach(sel => {
-      sel.addEventListener("change", async (ev) => {
-        const group = ev.target.dataset.group;
-        const node = ev.target.value;
-        await selectNode(group, node, ev.target);
-      });
+      sel.addEventListener("change", () => selectNode(sel));
     });
+    filterGroups();
+    return data.groups || [];
   } catch (e) {
     console.error("[ClashProxy] proxies error", e);
+    overview.textContent = "暂时无法读取转发线路";
     el.innerHTML = `<div class="error">获取节点失败: ${escapeHtml(e.message || String(e))}</div>`;
+    return null;
   }
 }
 
-function renderGroup(g) {
-  const options = (g.all || []).map(n =>
+function groupPath(name, groups) {
+  const path = [];
+  const seen = new Set();
+  while (name) {
+    if (seen.has(name)) return [...path, "循环引用"];
+    seen.add(name);
+    path.push(name);
+    const group = groups.get(name);
+    if (group?.type === "LoadBalance") return [...path, "按连接分配"];
+    if (group && !group.now) return [...path, "当前节点未知"];
+    name = group?.now;
+  }
+  return path;
+}
+
+function renderGroup(g, groups) {
+  const current = g.type === "LoadBalance"
+    ? "按连接分配"
+    : groupPath(g.name, groups).slice(1).join(" → ");
+  const selectionLabel = g.type === "Selector" ? "已选" : g.fixed ? "固定后当前线路" : "自动选路";
+  const members = g.all || [];
+  const options = members.map(n =>
     `<option value="${escapeHtml(n)}" ${n === g.now ? "selected" : ""}>${escapeHtml(n)}</option>`
   ).join("");
+  const placeholder = members.includes(g.now) ? "" : '<option value="" disabled selected>请选择节点</option>';
+  const control = g.type !== "LoadBalance" && options
+    ? `<select class="node-select" aria-label="${escapeHtml(g.name)}的节点"
+               data-group="${escapeHtml(g.name)}" data-current="${escapeHtml(members.includes(g.now) ? g.now : "")}">
+         ${placeholder}${options}
+       </select>`
+    : "";
   return `
-    <div class="group">
+    <div class="group" data-search="${escapeHtml(`${g.name} ${current}`)}">
       <div class="group-header">
         <strong>${escapeHtml(g.name)}</strong>
         <span class="badge">${escapeHtml(g.type || "")}</span>
-        <span class="now">当前: ${escapeHtml(g.now || "-")}</span>
       </div>
-      <select class="node-select" data-group="${escapeHtml(g.name)}">
-        ${options}
-      </select>
+      <div class="group-current">${selectionLabel} <strong>${escapeHtml(current)}</strong></div>
+      ${control}
     </div>
   `;
 }
 
-async function selectNode(group, node, selectEl) {
-  selectEl.disabled = true;
+function filterGroups() {
+  const query = document.getElementById("group-filter").value.trim().toLowerCase();
+  const rows = [...document.querySelectorAll("#groups .group")];
+  rows.forEach(row => { row.hidden = !row.dataset.search.toLowerCase().includes(query); });
+  document.getElementById("no-matching-groups").hidden = !rows.length || rows.some(row => !row.hidden);
+}
+
+async function selectNode(selectEl) {
+  const { group, current } = selectEl.dataset;
+  const node = selectEl.value;
+  const controls = document.querySelectorAll("#groups .node-select, #btn-refresh-proxies");
+  controls.forEach(control => { control.disabled = true; });
+  showNodeMsg(`正在更新「${group}」的选择…`);
   try {
     const res = await bridge.apiPost("proxies/select", { group, node });
-    if (res && res.ok) {
-      const nowSpan = selectEl.closest(".group")?.querySelector(".now");
-      if (nowSpan) nowSpan.textContent = `当前: ${node}`;
-      showMsg(`已切换到 ${node}`);
-    } else {
-      alert("切换失败: " + (res?.message || "未知错误"));
-    }
+    if (!res?.ok) throw new Error(res?.message || "切换失败");
+    const groups = await refreshProxies();
+    const confirmed = groups?.find(entry => entry.name === group)?.now;
+    showNodeMsg(confirmed
+      ? `「${group}」当前选择：${confirmed}`
+      : "控制器已接收切换，请刷新节点列表确认当前选择。", !confirmed);
   } catch (e) {
-    console.error("[ClashProxy] select error", e);
-    alert("切换失败: " + (e.message || e));
+    selectEl.value = current;
+    showNodeMsg(`「${group}」切换失败：${e.message || e}`, true);
   } finally {
-    selectEl.disabled = false;
+    controls.forEach(control => { control.disabled = false; });
   }
 }
 
@@ -136,9 +189,7 @@ async function refreshSubs() {
     const subs = data.subscriptions || [];
     const applied = data.applied;
     const label = !data.builtin ? "面板最后应用" : data.running ? "当前配置" : "内置核心已保存（未运行）";
-    const source = applied?.kind === "subscription"
-      ? applied.url || "已从列表删除的订阅"
-      : applied?.name || "暂无应用记录";
+    const source = applied?.kind === "subscription" ? applied.url || "已从列表删除的订阅" : "暂无链接订阅记录";
     current.textContent = `${label}：${source}`;
     if (subs.length === 0) {
       el.innerHTML = `<div class="muted">暂无订阅</div>`;
@@ -185,7 +236,7 @@ async function applySub(url, button) {
     const res = await bridge.apiPost("subscriptions/select", { url });
     if (!res?.pushed) throw new Error(res?.message || "应用失败");
     showMsg(res.message || "已应用订阅");
-    await Promise.allSettled([refreshSubs(), refreshProxies(), refreshStatus()]);
+    await refreshAll();
   } catch (e) {
     showMsg(e.message || String(e), true);
   } finally {
@@ -274,18 +325,26 @@ async function updateSubs() {
 
 async function refreshConfigs() {
   const el = document.getElementById("configs-list");
-  if (!el) return;
+  const active = document.getElementById("yaml-active");
   try {
     const data = await bridge.apiGet("configs/list");
     const files = data.files || [];
+    const applied = data.applied;
+    const label = applied ? yamlStatus[applied.status] || "应用记录" : "";
+    active.textContent = applied ? `${label}：${applied.filename}` : "暂无本地 YAML 应用记录";
     if (files.length === 0) {
       el.innerHTML = `<div class="muted">暂无本地配置文件</div>`;
       return;
     }
     el.innerHTML = files.map(f => `
-      <div class="sub-item">
-        <span class="sub-url">${escapeHtml(f.name)} <small>(${(f.size/1024).toFixed(1)} KB)</small></span>
-        <button class="btn primary small" data-filename="${escapeHtml(f.name)}">推送到 Clash</button>
+      <div class="sub-item${f.name === applied?.filename ? " active-config" : ""}">
+        <div class="sub-url">
+          ${f.name === applied?.filename ? `<strong class="sub-active">${escapeHtml(label)}</strong>` : ""}
+          <span>${escapeHtml(f.name)} <small>(${(f.size / 1024).toFixed(1)} KB)</small></span>
+        </div>
+        <button class="btn primary small" data-filename="${escapeHtml(f.name)}">
+          ${f.name === applied?.filename ? "重新推送" : "推送到 Clash"}
+        </button>
       </div>
     `).join("");
     el.querySelectorAll("button[data-filename]").forEach(btn => {
@@ -298,6 +357,7 @@ async function refreshConfigs() {
     });
   } catch (e) {
     console.error("[ClashProxy] configs list error", e);
+    active.textContent = "暂时无法读取 YAML 应用记录";
     el.innerHTML = `<div class="error">加载配置列表失败</div>`;
   }
 }
@@ -312,7 +372,7 @@ async function reloadConfig(filename, btn) {
     console.log("[ClashProxy] reload response", res);
     if (res && res.ok) {
       showConfigMsg(res.message || "已应用配置");
-      await Promise.allSettled([refreshSubs(), refreshProxies(), refreshStatus()]);
+      await refreshAll();
     } else {
       const msg = res?.message || res?.error || JSON.stringify(res);
       showConfigMsg("推送失败: " + msg, true);
@@ -330,30 +390,29 @@ async function reloadConfig(filename, btn) {
 
 async function importPaste(autoPush) {
   const textarea = document.getElementById("yaml-paste");
-  const content = (textarea && textarea.value ? textarea.value : "").replace(/^\uFEFF/, "");
-  if (!content.trim()) {
-    showConfigMsg("请先把完整 YAML 粘贴到文本框", true);
-    return;
-  }
-  if (content.trim().length < 50) {
-    showConfigMsg("内容过短，请粘贴完整的 Clash YAML", true);
-    return;
-  }
+  const fileInput = document.getElementById("yaml-file");
+  const nameInput = document.getElementById("yaml-name");
+  const file = fileInput.files[0];
+  const filename = nameInput.value.trim() || file?.name || "pasted.yaml";
+  const pushButton = document.getElementById("btn-import-paste");
+  const saveButton = document.getElementById("btn-import-save-only");
+  const btn = autoPush ? pushButton : saveButton;
+  const original = btn.textContent;
 
-  const btn = autoPush
-    ? document.getElementById("btn-import-paste")
-    : document.getElementById("btn-import-save-only");
-  const original = btn ? btn.textContent : "";
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "传输中...";
-  }
-
-  const CHUNK = 80000;
-  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const total = Math.ceil(content.length / CHUNK);
+  pushButton.disabled = true;
+  saveButton.disabled = true;
+  btn.textContent = "传输中…";
 
   try {
+    const content = (file ? await file.text() : textarea.value).replace(/^\uFEFF/, "");
+    if (content.trim().length < 50) {
+      showConfigMsg("请选择 YAML 文件或粘贴完整的 Clash/Mihomo 配置", true);
+      return;
+    }
+    const CHUNK = 80000;
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const total = Math.ceil(content.length / CHUNK);
+
     for (let i = 0; i < total; i++) {
       const part = content.slice(i * CHUNK, (i + 1) * CHUNK);
       showConfigMsg("正在发送 " + (i + 1) + "/" + total + "（" + content.length + " 字符）");
@@ -371,19 +430,16 @@ async function importPaste(autoPush) {
     const res = await bridge.apiPost("configs/import-paste/finish", {
       id: id,
       auto_push: !!autoPush,
-      filename: "pasted.yaml"
+      filename
     });
     console.log("[ClashProxy] paste finish", res);
     if (res && res.ok) {
-      let msg = res.message || "操作完成";
-      if (res.pushed) {
-        msg += "，节点已更新";
-        await Promise.allSettled([refreshSubs(), refreshProxies(), refreshStatus()]);
-      }
-      const failed = msg.indexOf("失败") >= 0 || msg.indexOf("异常") >= 0;
-      showConfigMsg(msg, failed);
-      if (textarea) textarea.value = "";
-      await refreshConfigs();
+      showConfigMsg(`${res.filename || filename} · ${res.message || "已保存"}`, autoPush && !res.pushed);
+      textarea.value = "";
+      fileInput.value = "";
+      nameInput.value = "pasted.yaml";
+      if (res.pushed) await refreshAll();
+      else await refreshConfigs();
     } else {
       showConfigMsg((res && (res.message || res.error)) || "导入失败", true);
     }
@@ -391,11 +447,16 @@ async function importPaste(autoPush) {
     console.error("[ClashProxy] paste import error", e);
     showConfigMsg("导入失败: " + (e && e.message ? e.message : e), true);
   } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = original;
-    }
+    pushButton.disabled = false;
+    saveButton.disabled = false;
+    btn.textContent = original;
   }
+}
+
+function showNodeMsg(text, isError = false) {
+  const el = document.getElementById("node-message");
+  el.textContent = text;
+  el.className = "message " + (isError ? "error" : "ok");
 }
 
 function showConfigMsg(text, isError = false) {

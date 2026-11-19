@@ -32,7 +32,6 @@ body {
 .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
 header { margin-bottom: 24px; }
 h1 { margin: 0 0 4px; font-size: 1.6rem; }
-.subtitle { margin: 0; color: var(--muted); font-size: 0.95rem; }
 
 .card {
   background: var(--card);
@@ -43,6 +42,8 @@ h1 { margin: 0 0 4px; font-size: 1.6rem; }
   box-shadow: 0 1px 3px rgba(0,0,0,0.05);
 }
 .card h2 { margin: 0 0 16px; font-size: 1.2rem; }
+.section-title { font-size: 1.2rem; font-weight: 600; cursor: pointer; }
+details[open] > .section-title { margin-bottom: 16px; }
 
 .status-grid {
   display: grid;
@@ -55,14 +56,33 @@ h1 { margin: 0 0 4px; font-size: 1.6rem; }
   padding: 12px;
   border-radius: 8px;
   border: 1px solid var(--border);
+  overflow-wrap: anywhere;
 }
 .status-item.ok { border-color: var(--ok); background: rgba(16,185,129,0.08); }
 .status-item.error { border-color: var(--error); background: rgba(239,68,68,0.08); }
 
+.selection-summary {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--primary);
+  border-radius: 6px;
+  background: rgba(59,130,246,0.08);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.group-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 16px;
+}
+.group-tools input { flex: 1 1 12rem; min-width: 0; }
 .group {
   margin-bottom: 16px;
   padding-bottom: 16px;
   border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
 }
 .group:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
 .group-header {
@@ -79,7 +99,8 @@ h1 { margin: 0 0 4px; font-size: 1.6rem; }
   padding: 2px 6px;
   border-radius: 4px;
 }
-.now { color: var(--muted); font-size: 0.9rem; margin-left: auto; }
+.group-current { color: var(--muted); margin-bottom: 8px; }
+.group-current strong { color: var(--text); }
 .node-select {
   width: 100%;
   padding: 8px 12px;
@@ -95,8 +116,7 @@ h1 { margin: 0 0 4px; font-size: 1.6rem; }
   gap: 8px;
   margin-bottom: 16px;
 }
-.sub-form input {
-  flex: 1;
+.sub-form input, .yaml-form input, .yaml-form textarea, .group-tools input {
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -104,6 +124,15 @@ h1 { margin: 0 0 4px; font-size: 1.6rem; }
   color: var(--text);
   font-size: 0.95rem;
 }
+.sub-form input { flex: 1; min-width: 0; }
+.yaml-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+.yaml-form input, .yaml-form textarea { width: 100%; min-width: 0; }
+.yaml-form summary { cursor: pointer; }
+.yaml-form textarea { margin-top: 8px; resize: vertical; font-family: monospace; }
 .sub-item {
   display: flex;
   align-items: center;
@@ -123,7 +152,8 @@ h1 { margin: 0 0 4px; font-size: 1.6rem; }
 }
 .sub-item-actions { display: flex; gap: 8px; flex-shrink: 0; }
 .sub-active { margin-right: 6px; color: var(--text); }
-.actions { display: flex; gap: 8px; margin-top: 12px; }
+.active-config { border-bottom-color: var(--primary); }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 
 .btn {
   padding: 8px 16px;

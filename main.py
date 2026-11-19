@@ -84,7 +84,7 @@ def merge_runtime_keys(content: str, runtime: Dict[str, Any]) -> str:
     return dump_yaml(data)
 
 
-@register(PLUGIN_NAME, "pan xie", "Clash 代理管理与订阅导入插件（支持内置核心）", "1.4.3")
+@register(PLUGIN_NAME, "pan xie", "Clash 代理管理与订阅导入插件（支持内置核心）", "1.4.4")
 class ClashProxyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -311,6 +311,19 @@ class ClashProxyPlugin(Star):
 
     def _set_last_applied(self, filename: str):
         self._save_state({"last_applied": filename, "last_applied_target": self._applied_target()})
+
+    def _get_applied_source(self) -> Tuple[str, str]:
+        state = self._load_state()
+        source = state.get("last_applied")
+        target = state.get("last_applied_target")
+        if not isinstance(source, str) or not source or (target and target != self._applied_target()):
+            return "", ""
+        if not target:
+            return source, "legacy"
+        if self.config.get("use_builtin_core", False):
+            running = self.core_process is not None and self.core_process.returncode is None
+            return source, "running" if running else "saved"
+        return source, "last_applied"
 
     def _find_restore_source(self) -> Optional[Path]:
         name = self._get_last_applied()
@@ -539,42 +552,49 @@ class ClashProxyPlugin(Star):
                     if resp.status != 200:
                         return {"ok": False, "url": base, "message": f"HTTP {resp.status}"}
                     version = (await resp.json()).get("version", "unknown")
-                mode = None
-                try:
-                    async with session.get(
-                        f"{base}/configs", headers=headers, timeout=aiohttp.ClientTimeout(total=3)
-                    ) as resp:
-                        if resp.status == 200:
-                            mode = (await resp.json()).get("mode")
-                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, AttributeError):
-                    pass
+                mode = await self._get_controller_mode(session, base, headers)
                 return {"ok": True, "url": base, "version": version, "mode": mode}
         except Exception as e:
             return {"ok": False, "url": base, "message": str(e)}
 
+    async def _get_controller_mode(self, session: aiohttp.ClientSession, base: str, headers: dict) -> Optional[str]:
+        try:
+            async with session.get(
+                f"{base}/configs", headers=headers, timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                if resp.status == 200:
+                    mode = (await resp.json()).get("mode")
+                    if isinstance(mode, str):
+                        return mode.lower()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, AttributeError):
+            pass
+        return None
+
     async def _get_proxies_from_clash(self) -> dict:
         base = self._get_controller_base()
+        headers = self._get_headers()
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{base}/proxies",
-                    headers=self._get_headers(),
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status != 200:
                         return {"ok": False, "message": f"HTTP {resp.status}"}
                     data = await resp.json()
-                    proxies = data.get("proxies", {})
-                    groups = []
-                    for name, info in proxies.items():
-                        if info.get("type") in ("Selector", "URLTest", "Fallback", "LoadBalance"):
-                            groups.append({
-                                "name": name,
-                                "type": info.get("type"),
-                                "now": info.get("now"),
-                                "all": info.get("all", [])
-                            })
-                    return {"ok": True, "groups": groups}
+                groups = []
+                for name, info in data.get("proxies", {}).items():
+                    if info.get("type") in ("Selector", "URLTest", "Fallback", "LoadBalance"):
+                        groups.append({
+                            "name": name,
+                            "type": info["type"],
+                            "now": info.get("now"),
+                            "fixed": info.get("fixed"),
+                            "all": info.get("all", []),
+                        })
+                mode = await self._get_controller_mode(session, base, headers)
+                return {"ok": True, "groups": groups, "mode": mode}
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
@@ -618,10 +638,9 @@ class ClashProxyPlugin(Star):
 
     async def api_get_subs(self):
         subs = await self._get_subscriptions()
-        state = self._load_state()
-        source = state.get("last_applied")
+        source, status = self._get_applied_source()
         applied = None
-        if source and state.get("last_applied_target") == self._applied_target():
+        if source and status != "legacy":
             if source.startswith(f"{SUBSCRIPTION_CACHE_DIR}/"):
                 url = next((url for url in subs if self._subscription_source(url) == source), None)
                 applied = {"kind": "subscription", "url": url}
@@ -822,7 +841,15 @@ class ClashProxyPlugin(Star):
             for p in sorted(self.subs_dir.iterdir()):
                 if p.is_file() and p.suffix.lower() in (".yaml", ".yml"):
                     files.append({"name": p.name, "size": p.stat().st_size})
-        return json_response({"files": files})
+        source, status = self._get_applied_source()
+        applied = None
+        if source and not source.startswith(f"{SUBSCRIPTION_CACHE_DIR}/"):
+            filename = next(
+                (file["name"] for file in files if os.path.normcase(file["name"]) == os.path.normcase(source)),
+                source,
+            )
+            applied = {"filename": filename, "status": status}
+        return json_response({"files": files, "applied": applied})
 
     async def api_import_paste_chunk(self):
         """接收粘贴内容的一小段，避免一次提交整份大 YAML。"""
@@ -859,7 +886,7 @@ class ClashProxyPlugin(Star):
             parts = bucket.get("parts") or {}
             if total <= 0 or len(parts) != total or any(i not in parts for i in range(total)):
                 return error_response(f"内容不完整（{len(parts)}/{total}），请重新粘贴")
-            content = "".join(parts[i] for i in range(total)).strip()
+            content = "".join(parts[i] for i in range(total)).strip().replace("\r\n", "\n").replace("\r", "\n")
             if len(content) < 50:
                 return error_response("内容过短，请粘贴完整的 YAML")
             try:
@@ -871,9 +898,20 @@ class ClashProxyPlugin(Star):
 
             if not filename.lower().endswith((".yaml", ".yml")):
                 filename += ".yaml"
-            safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)
+            safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename).lstrip(".")
+            if Path(safe_name).suffix.lower() not in (".yaml", ".yml"):
+                safe_name = "pasted.yaml"
             target = self.subs_dir / safe_name
-            target.write_text(content, encoding="utf-8")
+            stem, suffix = target.stem, target.suffix
+            version = 2
+            while target.exists() and (
+                not target.is_file() or target.read_text(encoding="utf-8", errors="replace") != content
+            ):
+                target = self.subs_dir / f"{stem}-{version}{suffix}"
+                version += 1
+            if not target.exists():
+                self._write_text_atomic(target, content)
+            safe_name = target.name
             push = {"pushed": False, "message": "已保存"}
             if auto_push:
                 push = await self._push_payload(content, source_name=safe_name)
@@ -917,7 +955,11 @@ class ClashProxyPlugin(Star):
 
     async def api_select_proxy(self):
         payload = await request.json(default={})
-        result = await self._select_proxy(payload.get("group"), payload.get("node"))
+        group = payload.get("group")
+        node = payload.get("node")
+        if not all(isinstance(value, str) and value for value in (group, node)):
+            return error_response("请提供策略组和节点名称")
+        result = await self._select_proxy(group, node)
         if result.get("ok"):
             return json_response(result)
         return error_response(result.get("message"))
